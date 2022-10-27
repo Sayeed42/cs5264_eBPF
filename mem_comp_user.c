@@ -16,7 +16,8 @@ static int print_bpf_verifier(enum libbpf_print_level level,
 int main(int argc, char *argv[])
 {
 	struct rlimit r = {RLIM_INFINITY, RLIM_INFINITY};
-	struct bpf_link *link = NULL;
+	struct bpf_link *links[2] = {};
+	int link_count = 0;
 	struct bpf_program *prog;
 	struct bpf_object *obj;
 	char filename[PATH_MAX];
@@ -47,17 +48,15 @@ int main(int argc, char *argv[])
 		goto cleanup;
 	}
 
-	prog = bpf_object__find_program_by_name(obj, "mem_prog1");
-	if (!prog) {
-		fprintf(stderr, "ERROR: finding a prog in obj file failed\n");
-		goto cleanup;
-	}
-
-	link = bpf_program__attach(prog);
-	if (libbpf_get_error(link)) {
-		fprintf(stderr, "ERROR: bpf_program__attach failed\n");
-		link = NULL;
-		goto cleanup;
+	bpf_object__for_each_program(prog, obj) {
+		links[link_count] = bpf_program__attach(prog);
+		err = libbpf_get_error(links[link_count]);
+		if (err < 0) {
+			fprintf(stderr, "ERROR: bpf_program__attach failed\n");
+			links[link_count] = NULL;
+			goto cleanup;
+		}
+		link_count++;
 	}
 
 	int sig, quit = 0;
@@ -100,7 +99,9 @@ int main(int argc, char *argv[])
 	}
 
 cleanup:
-	bpf_link__destroy(link);
+	while (link_count) {
+		bpf_link__destroy(links[--link_count]);
+	}
 	bpf_object__close(obj);
 	return 0;
 }
