@@ -1,3 +1,15 @@
+diff --git a/arch/x86/entry/syscalls/syscall_64.tbl b/arch/x86/entry/syscalls/syscall_64.tbl
+index c84d12608cd2..5ea8a5ab8e41 100644
+--- a/arch/x86/entry/syscalls/syscall_64.tbl
++++ b/arch/x86/entry/syscalls/syscall_64.tbl
+@@ -372,6 +372,7 @@
+ 448	common	process_mrelease	sys_process_mrelease
+ 449	common	futex_waitv		sys_futex_waitv
+ 450	common	set_mempolicy_home_node	sys_set_mempolicy_home_node
++451 common  mem_bpf_hook    sys_mem_bpf_hook
+ 
+ #
+ # Due to a historical design error, certain syscalls are numbered differently
 diff --git a/include/linux/bpf.h b/include/linux/bpf.h
 index 2b914a56a2c5..39b928176a50 100644
 --- a/include/linux/bpf.h
@@ -36,20 +48,38 @@ index e8439f6cbe57..9b90da489915 100644
  
  #define MAX_USED_MAPS 64 /* max number of maps accessed by one eBPF program */
 diff --git a/include/linux/filter.h b/include/linux/filter.h
-index ed0c0ff42ad5..71716503822f 100644
+index ed0c0ff42ad5..432a9b7daa9c 100644
 --- a/include/linux/filter.h
 +++ b/include/linux/filter.h
-@@ -1557,4 +1557,8 @@ static __always_inline int __bpf_xdp_redirect_map(struct bpf_map *map, u32 ifind
+@@ -1557,4 +1557,12 @@ static __always_inline int __bpf_xdp_redirect_map(struct bpf_map *map, u32 ifind
  	return XDP_REDIRECT;
  }
  
 +struct bpf_mem_swap_kern {
 +	struct page *page;
-+}
++	char *page_data;
++	char *scratch_page;
++	struct bpf_spin_lock lock;
++	bool intercepted;
++};
 +
  #endif /* __LINUX_FILTER_H__ */
+diff --git a/include/linux/syscalls.h b/include/linux/syscalls.h
+index a34b0f9a9972..565ab68ff461 100644
+--- a/include/linux/syscalls.h
++++ b/include/linux/syscalls.h
+@@ -855,6 +855,9 @@ asmlinkage long sys_shutdown(int, int);
+ asmlinkage long sys_sendmsg(int fd, struct user_msghdr __user *msg, unsigned flags);
+ asmlinkage long sys_recvmsg(int fd, struct user_msghdr __user *msg, unsigned flags);
+ 
++/* mm/page_io.c */
++asmlinkage long sys_mem_bpf_hook(unsigned int bpf_fd, char __user *page_data, unsigned int num_page_data_pages, char __user *scratch_buf);
++
+ /* mm/filemap.c */
+ asmlinkage long sys_readahead(int fd, loff_t offset, size_t count);
+ 
 diff --git a/include/uapi/linux/bpf.h b/include/uapi/linux/bpf.h
-index ef78e0e1a754..3c81135b3dd4 100644
+index ef78e0e1a754..c33ac3f05868 100644
 --- a/include/uapi/linux/bpf.h
 +++ b/include/uapi/linux/bpf.h
 @@ -952,6 +952,7 @@ enum bpf_prog_type {
@@ -68,13 +98,17 @@ index ef78e0e1a754..3c81135b3dd4 100644
  	__MAX_BPF_ATTACH_TYPE
  };
  
-@@ -6762,4 +6764,8 @@ struct bpf_core_relo {
+@@ -6762,4 +6764,12 @@ struct bpf_core_relo {
  	enum bpf_core_relo_kind kind;
  };
  
 +struct bpf_mem_swap {
 +	struct page *page;
-+}
++	char *page_data;
++	char *scratch_page;
++	struct bpf_spin_lock lock;
++	_Bool intercepted;
++};
 +
  #endif /* _UAPI__LINUX_BPF_H__ */
 diff --git a/kernel/bpf/syscall.c b/kernel/bpf/syscall.c
@@ -119,3 +153,261 @@ index 2b69306d3c6e..16e8a0cfe94e 100644
  	default:
  		return -EINVAL;
  	}
+diff --git a/kernel/bpf/verifier.c b/kernel/bpf/verifier.c
+index 0efbac0fd126..058dc0b8a808 100644
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -3956,6 +3956,9 @@ static int check_ctx_access(struct bpf_verifier_env *env, int insn_idx, int off,
+ 		 */
+ 		*reg_type = info.reg_type;
+ 
++		if (*reg_type == PTR_TO_MEM) {
++			env->insn_aux_data[insn_idx].mem_size = info.mem_size;
++		}
+ 		if (base_type(*reg_type) == PTR_TO_BTF_ID) {
+ 			*btf = info.btf;
+ 			*btf_id = info.btf_id;
+@@ -4810,6 +4813,9 @@ static int check_mem_access(struct bpf_verifier_env *env, int insn_idx, u32 regn
+ 			 */
+ 			if (reg_type == SCALAR_VALUE) {
+ 				mark_reg_unknown(env, regs, value_regno);
++			} else if (reg_type == PTR_TO_MEM) {
++				mark_reg_known_zero(env, regs, value_regno);
++				regs[value_regno].mem_size = env->insn_aux_data[insn_idx].mem_size; 
+ 			} else {
+ 				mark_reg_known_zero(env, regs,
+ 						    value_regno);
+diff --git a/mm/Makefile b/mm/Makefile
+index 6f9ffa968a1a..05d8e2bb749e 100644
+--- a/mm/Makefile
++++ b/mm/Makefile
+@@ -54,7 +54,7 @@ obj-y			:= filemap.o mempool.o oom_kill.o fadvise.o \
+ 			   mm_init.o percpu.o slab_common.o \
+ 			   compaction.o vmacache.o \
+ 			   interval_tree.o list_lru.o workingset.o \
+-			   debug.o gup.o mmap_lock.o $(mmu-y)
++			   debug.o gup.o mmap_lock.o $(mmu-y) page_io.o
+ 
+ # Give 'page_alloc' its own module-parameter namespace
+ page-alloc-y := page_alloc.o
+diff --git a/mm/page_io.c b/mm/page_io.c
+index 68318134dc92..1a91b6a821e1 100644
+--- a/mm/page_io.c
++++ b/mm/page_io.c
+@@ -26,8 +26,209 @@
+ #include <linux/uio.h>
+ #include <linux/sched/task.h>
+ #include <linux/delayacct.h>
++#include <linux/spinlock.h>
++#include <linux/types.h>
++#include <linux/printk.h>
++#include <linux/bpf.h>
++#include <linux/filter.h>
++#include <linux/syscalls.h>
+ #include "swap.h"
+ 
++struct mem_swap_bpf_info {
++	int fd;
++	struct page **page_data_pages;
++	struct page *scratch_page;
++	struct bpf_spin_lock bpf_lock;
++};
++static struct mem_swap_bpf_info bpf_info;
++static bool mem_swap_bpf_enabled = false;
++static unsigned int bpf_num_pages;
++
++struct mem_swap_bpf_page {
++	char *addr;
++	struct list_head list;
++};
++static LIST_HEAD(bpf_pages_list);
++
++static DEFINE_SPINLOCK(bpf_mem_swap_lock);
++
++SYSCALL_DEFINE4(mem_bpf_hook, unsigned int, bpf_fd, char __user *, page_data, unsigned int, num_page_data_pages, char __user *, scratch_buf)
++{
++	// TODO:
++	// [x] Memcpy from page to char * page_data in context
++	// [x] Give user the page in context
++	// [ ] Respond to user saying they intercepted (i.e. free page immediately?)
++	// [ ] Create separate ebpf hook point for read/write OR provide argument in context indicating operation
++
++	struct bpf_prog *ebpf_prog;
++	struct bpf_mem_swap_kern ebpf_context;
++	u32 ebpf_return;
++	struct mem_swap_bpf_page *page_data_page;
++	int ret = 0;
++	int i;
++	
++	spin_lock(&bpf_mem_swap_lock);
++
++	// Save bpf-related info
++	bpf_info.fd = bpf_fd;
++	mem_swap_bpf_enabled = true;
++	bpf_num_pages = num_page_data_pages;
++	memset(&bpf_info.bpf_lock, 0, sizeof(struct bpf_spin_lock));
++
++	// Initialize some information shared by bpf calls
++	// TODO: Update the user space code to reserve 4 pages (0x4000), so that this is valid
++	if (get_user_pages_fast((unsigned long)scratch_buf, 1, FOLL_WRITE, &bpf_info.scratch_page) != 1) {
++		ret = -EINVAL;
++		printk("BPF swap: Could not get scratch page\n");
++		spin_unlock(&bpf_mem_swap_lock);
++		return ret;
++	}
++
++	// Grab pages for storing memory contents into a user-space buffer (num_page_data_pages indicates how many pages we were given)
++	if (get_user_pages_fast((unsigned long)page_data, bpf_num_pages, FOLL_WRITE, bpf_info.page_data_pages) != bpf_num_pages) {
++		ret = -EINVAL;
++		printk("BPF swap: Could not get page data page\n");
++		spin_unlock(&bpf_mem_swap_lock);
++		return ret;
++	}
++	bpf_info.page_data_pages = kmalloc(sizeof(struct page) * bpf_num_pages, GFP_KERNEL);
++	for (i = 0; i < bpf_num_pages; i++) {
++		// Track pages that we can actively use with a list (must acquire lock before using)
++		struct mem_swap_bpf_page *bpf_page = kmalloc(sizeof(struct mem_swap_bpf_page), GFP_KERNEL);
++		bpf_page->addr = page_address(bpf_info.page_data_pages[i]);
++		INIT_LIST_HEAD(&bpf_page->list);
++		list_add(&bpf_pages_list, bpf_pages_list.prev);
++	}
++
++	printk("[BPF swap] Initialized bpf info enabled: %d fd: %d\n", mem_swap_bpf_enabled, bpf_info.fd);
++
++	spin_unlock(&bpf_mem_swap_lock);
++	
++	// TODO: Move following code into relevant functions
++
++	// Run ebpf code
++	memset(&ebpf_context, 0, sizeof(struct bpf_mem_swap_kern));
++	ebpf_context = (struct bpf_mem_swap_kern){
++		.page = NULL,
++		.page_data = NULL,
++		.scratch_page = page_address(bpf_info.scratch_page),
++		.lock = bpf_info.bpf_lock,
++		.intercepted = false,
++	};
++
++	spin_lock(&bpf_mem_swap_lock);
++
++	if (list_empty(&bpf_pages_list)) {
++		// Can't execute ebpf code without user-space page for page data buffer
++		// TODO: Make skip ebpf code in final code (instead of returning)
++		spin_unlock(&bpf_mem_swap_lock);
++		return -ENOMEM;
++	} else {
++		page_data_page = list_entry(bpf_pages_list.next, struct mem_swap_bpf_page, list);
++		list_del(&page_data_page->list);
++		ebpf_context.page_data = page_data_page->addr;
++
++		// TODO: Make use actual page in swap_writepage
++		// memcpy_from_page(page, page_data_page, 0, PAGE_SIZE);
++	}
++	spin_unlock(&bpf_mem_swap_lock);
++
++	ebpf_prog = bpf_prog_get_type(bpf_fd, BPF_PROG_TYPE_MEM_SWAP);
++	if (IS_ERR(ebpf_prog)) {
++		ret = -EINVAL;
++		printk("test_mem_swap: failed to get bpf prog\n");
++		return ret;
++	}
++
++	preempt_disable();
++	ebpf_return = bpf_prog_run(ebpf_prog, &ebpf_context);
++	if (ebpf_return == EINVAL) {
++		printk("test_mem_swap: ebpf search failed\n");
++	} else if (ebpf_return != 0) {
++		printk("test_mem_swap: ebpf search unknown error %d\n", ebpf_return);
++	}
++	preempt_enable();
++
++	// Add page back, so that it can be used by a future bpf execution
++	spin_lock(&bpf_mem_swap_lock);
++	list_add(&bpf_pages_list, bpf_pages_list.prev);
++	spin_unlock(&bpf_mem_swap_lock);
++
++	// TODO: Make use of actual page in swap_writepage
++	// if (ebpf_return == 0 && ebpf_context.intercepted) {
++	// 	page_unlock(page);
++	// }
++
++	printk("[BPF swap] intercepted: %d retval: %d\n", ebpf_context.intercepted, ebpf_return);
++
++	return ebpf_return;
++}
++
++int mem_swap_bpf_prog_attach(const union bpf_attr *attr, struct bpf_prog *prog)
++{
++	return 0;
++}
++
++int mem_swap_bpf_prog_detach(const union bpf_attr *attr)
++{
++	return 0;
++}
++
++const struct bpf_prog_ops mem_swap_prog_ops = {};
++
++static const struct bpf_func_proto *
++mem_swap_func_proto(enum bpf_func_id func_id, const struct bpf_prog *prog)
++{
++	return bpf_base_func_proto(func_id);
++}
++
++static bool mem_swap_is_valid_access(int off, int size, enum bpf_access_type type, const struct bpf_prog *prog, struct bpf_insn_access_aux *info){
++	int size_of_field;
++
++	if (off < 0 || size < 0 || off + size > sizeof(struct bpf_mem_swap))
++		return false;
++
++	switch (off) {
++	case bpf_ctx_range(struct bpf_mem_swap, intercepted):
++		size_of_field = sizeof_field(struct bpf_mem_swap, intercepted);
++		if (!bpf_ctx_narrow_access_ok(off, size, size_of_field))
++			return false;
++		break;
++	case bpf_ctx_range(struct bpf_mem_swap, lock):
++		size_of_field = sizeof_field(struct bpf_mem_swap, lock);
++		if (!bpf_ctx_narrow_access_ok(off, size, size_of_field))
++			return false;
++		break;
++	case bpf_ctx_range(struct bpf_mem_swap, page):
++		size_of_field = sizeof_field(struct bpf_mem_swap, lock);
++		if (!bpf_ctx_narrow_access_ok(off, size, size_of_field))
++			return false;
++		break;
++	case bpf_ctx_range(struct bpf_mem_swap, page_data):
++		size_of_field = sizeof_field(struct bpf_mem_swap, page);
++		if (!bpf_ctx_narrow_access_ok(off, size, size_of_field))
++			return false;
++		info->reg_type = PTR_TO_MEM;
++		info->mem_size = PAGE_SIZE;
++		break;
++	case bpf_ctx_range(struct bpf_mem_swap, scratch_page):
++		size_of_field = sizeof_field(struct bpf_mem_swap, scratch_page);
++		if (type != BPF_READ || size != size_of_field || off != offsetof(struct bpf_mem_swap, scratch_page))
++			return false;
++		info->reg_type = PTR_TO_MEM;
++		info->mem_size = PAGE_SIZE;
++		break;
++	default:
++		return false;
++	}
++	return true;
++}
++
++const struct bpf_verifier_ops mem_swap_verifier_ops = {
++	.get_func_proto = mem_swap_func_proto,
++	.is_valid_access = mem_swap_is_valid_access,
++};
++
+ void end_swap_bio_write(struct bio *bio)
+ {
+ 	struct page *page = bio_first_page_all(bio);
+@@ -529,4 +730,4 @@ void __swap_read_unplug(struct swap_iocb *sio)
+ 	ret = mapping->a_ops->swap_rw(&sio->iocb, &from);
+ 	if (ret != -EIOCBQUEUED)
+ 		sio_read_complete(&sio->iocb, ret);
+-}
++}
+\ No newline at end of file

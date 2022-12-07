@@ -2,10 +2,14 @@
 #include <signal.h>
 #include <sys/resource.h>
 #include <linux/limits.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 
 #include <linux/bpf.h>
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
+
+#define aligned_alloca(align, size) (((uintptr_t)alloca((size) + (align)-1) + ((align)-1)) & ~(uintptr_t)((align)-1));
 
 static int print_bpf_verifier(enum libbpf_print_level level,
 							const char *format, va_list args)
@@ -16,12 +20,9 @@ static int print_bpf_verifier(enum libbpf_print_level level,
 int main(int argc, char *argv[])
 {
 	struct rlimit r = {RLIM_INFINITY, RLIM_INFINITY};
-	struct bpf_link *links[2] = {};
-	int link_count = 0;
-	struct bpf_program *prog;
 	struct bpf_object *obj;
 	char filename[PATH_MAX];
-	int err, ret = 0;
+	int err, ret = 0, progfd;
 
 	snprintf(filename, sizeof(filename), "%s_kern.o", argv[0]);
 
@@ -37,30 +38,31 @@ int main(int argc, char *argv[])
 	}
 	libbpf_set_print(print_bpf_verifier);
 
-	obj = bpf_object__open(filename);
-	if (libbpf_get_error(obj)) {
-		fprintf(stderr, "ERROR: opening BPF object file failed\n");
-		return 0;
+	ret = bpf_prog_load(filename, BPF_PROG_TYPE_MEM_SWAP, &obj, &progfd);
+	if (ret) {
+			printf("Failed to load bpf program\n");
+			exit(1);
 	}
 
-	if (bpf_object__load(obj)) {
-		fprintf(stderr, "ERROR: loading BPF object file failed\n");
-		goto cleanup;
-	}
+	// Get a page that we can use in our bpf code (kinda hacky)
+	char* scratch_mem = aligned_alloca(4096, 4096);
+	memset(scratch_mem, 0, 4096);
 
-	bpf_object__for_each_program(prog, obj) {
-		links[link_count] = bpf_program__attach(prog);
-		err = libbpf_get_error(links[link_count]);
-		if (err < 0) {
-			fprintf(stderr, "ERROR: bpf_program__attach failed\n");
-			links[link_count] = NULL;
-			goto cleanup;
-		}
-		link_count++;
+	// Register our bpf code with our syscall
+	printf("First call\n");
+	int res = syscall(451, progfd, scratch_mem);
+	if (res != 0) {
+		fprintf(stderr, "Failure on syscall");
+		exit(res);
+	}
+	printf("Second call\n");
+	res = syscall(451, progfd, scratch_mem);
+	if (res != 0) {
+		fprintf(stderr, "Failure on syscall");
+		exit(res);
 	}
 
 	int sig, quit = 0;
-	FILE *fp = NULL;
 
 	err = sigprocmask(SIG_BLOCK, &signal_mask, NULL);
 	if (err != 0) {
@@ -78,13 +80,7 @@ int main(int argc, char *argv[])
 		switch (sig) {
 			case SIGINT:
 			case SIGTERM:
-				quit = 1;
-				break;
-
 			case SIGALRM:
-				if (fp != NULL) {
-					fclose(fp);
-				}
 				quit = 1;
 				break;
 
@@ -99,9 +95,6 @@ int main(int argc, char *argv[])
 	}
 
 cleanup:
-	while (link_count) {
-		bpf_link__destroy(links[--link_count]);
-	}
 	bpf_object__close(obj);
 	return 0;
 }
