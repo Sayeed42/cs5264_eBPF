@@ -1,0 +1,121 @@
+diff --git a/include/linux/bpf.h b/include/linux/bpf.h
+index 2b914a56a2c5..39b928176a50 100644
+--- a/include/linux/bpf.h
++++ b/include/linux/bpf.h
+@@ -615,6 +615,7 @@ struct bpf_insn_access_aux {
+ 			u32 btf_id;
+ 		};
+ 	};
++	int mem_size; /* for PTR_TO_MEM */
+ 	struct bpf_verifier_log *log; /* for verbose logs */
+ };
+ 
+diff --git a/include/linux/bpf_types.h b/include/linux/bpf_types.h
+index 2b9112b80171..891c7e362d35 100644
+--- a/include/linux/bpf_types.h
++++ b/include/linux/bpf_types.h
+@@ -79,6 +79,8 @@ BPF_PROG_TYPE(BPF_PROG_TYPE_LSM, lsm,
+ #endif
+ BPF_PROG_TYPE(BPF_PROG_TYPE_SYSCALL, bpf_syscall,
+ 	      void *, void *)
++BPF_PROG_TYPE(BPF_PROG_TYPE_MEM_SWAP, mem_swap,
++	      struct bpf_mem_swap, struct bpf_mem_swap_kern)
+ 
+ BPF_MAP_TYPE(BPF_MAP_TYPE_ARRAY, array_map_ops)
+ BPF_MAP_TYPE(BPF_MAP_TYPE_PERCPU_ARRAY, percpu_array_map_ops)
+diff --git a/include/linux/bpf_verifier.h b/include/linux/bpf_verifier.h
+index e8439f6cbe57..9b90da489915 100644
+--- a/include/linux/bpf_verifier.h
++++ b/include/linux/bpf_verifier.h
+@@ -384,6 +384,7 @@ struct bpf_insn_aux_data {
+ 	/* below fields are initialized once */
+ 	unsigned int orig_idx; /* original instruction index */
+ 	bool prune_point;
++	int mem_size; /* for PTR_TO_MEM */
+ };
+ 
+ #define MAX_USED_MAPS 64 /* max number of maps accessed by one eBPF program */
+diff --git a/include/linux/filter.h b/include/linux/filter.h
+index ed0c0ff42ad5..71716503822f 100644
+--- a/include/linux/filter.h
++++ b/include/linux/filter.h
+@@ -1557,4 +1557,8 @@ static __always_inline int __bpf_xdp_redirect_map(struct bpf_map *map, u32 ifind
+ 	return XDP_REDIRECT;
+ }
+ 
++struct bpf_mem_swap_kern {
++	struct page *page;
++}
++
+ #endif /* __LINUX_FILTER_H__ */
+diff --git a/include/uapi/linux/bpf.h b/include/uapi/linux/bpf.h
+index ef78e0e1a754..3c81135b3dd4 100644
+--- a/include/uapi/linux/bpf.h
++++ b/include/uapi/linux/bpf.h
+@@ -952,6 +952,7 @@ enum bpf_prog_type {
+ 	BPF_PROG_TYPE_LSM,
+ 	BPF_PROG_TYPE_SK_LOOKUP,
+ 	BPF_PROG_TYPE_SYSCALL, /* a program that can execute syscalls */
++	BPF_PROG_TYPE_MEM_SWAP,
+ };
+ 
+ enum bpf_attach_type {
+@@ -998,6 +999,7 @@ enum bpf_attach_type {
+ 	BPF_SK_REUSEPORT_SELECT_OR_MIGRATE,
+ 	BPF_PERF_EVENT,
+ 	BPF_TRACE_KPROBE_MULTI,
++	BPF_MEM_SWAP,
+ 	__MAX_BPF_ATTACH_TYPE
+ };
+ 
+@@ -6762,4 +6764,8 @@ struct bpf_core_relo {
+ 	enum bpf_core_relo_kind kind;
+ };
+ 
++struct bpf_mem_swap {
++	struct page *page;
++}
++
+ #endif /* _UAPI__LINUX_BPF_H__ */
+diff --git a/kernel/bpf/syscall.c b/kernel/bpf/syscall.c
+index 2b69306d3c6e..16e8a0cfe94e 100644
+--- a/kernel/bpf/syscall.c
++++ b/kernel/bpf/syscall.c
+@@ -3416,6 +3416,8 @@ attach_type_to_prog_type(enum bpf_attach_type attach_type)
+ 		return BPF_PROG_TYPE_SK_LOOKUP;
+ 	case BPF_XDP:
+ 		return BPF_PROG_TYPE_XDP;
++	case BPF_MEM_SWAP:
++		return BPF_PROG_TYPE_MEM_SWAP;
+ 	default:
+ 		return BPF_PROG_TYPE_UNSPEC;
+ 	}
+@@ -3426,6 +3428,9 @@ attach_type_to_prog_type(enum bpf_attach_type attach_type)
+ #define BPF_F_ATTACH_MASK \
+ 	(BPF_F_ALLOW_OVERRIDE | BPF_F_ALLOW_MULTI | BPF_F_REPLACE)
+ 
++int mem_swap_bpf_prog_attach(const union bpf_attr *attr, struct bpf_prog *prog);
++int mem_swap_bpf_prog_detach(const union bpf_attr *attr);
++
+ static int bpf_prog_attach(const union bpf_attr *attr)
+ {
+ 	enum bpf_prog_type ptype;
+@@ -3471,6 +3476,9 @@ static int bpf_prog_attach(const union bpf_attr *attr)
+ 	case BPF_PROG_TYPE_SOCK_OPS:
+ 		ret = cgroup_bpf_prog_attach(attr, ptype, prog);
+ 		break;
++	case BPF_PROG_TYPE_MEM_SWAP:
++		ret = mem_swap_bpf_prog_attach(attr, prog);
++		break;
+ 	default:
+ 		ret = -EINVAL;
+ 	}
+@@ -3507,6 +3515,8 @@ static int bpf_prog_detach(const union bpf_attr *attr)
+ 	case BPF_PROG_TYPE_CGROUP_SYSCTL:
+ 	case BPF_PROG_TYPE_SOCK_OPS:
+ 		return cgroup_bpf_prog_detach(attr, ptype);
++	case BPF_PROG_TYPE_MEM_SWAP:
++		return mem_swap_bpf_prog_detach(attr);
+ 	default:
+ 		return -EINVAL;
+ 	}
