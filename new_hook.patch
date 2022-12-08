@@ -191,10 +191,10 @@ index 6f9ffa968a1a..05d8e2bb749e 100644
  # Give 'page_alloc' its own module-parameter namespace
  page-alloc-y := page_alloc.o
 diff --git a/mm/page_io.c b/mm/page_io.c
-index 68318134dc92..1a91b6a821e1 100644
+index 68318134dc92..782c8e50ee4a 100644
 --- a/mm/page_io.c
 +++ b/mm/page_io.c
-@@ -26,8 +26,209 @@
+@@ -26,8 +26,207 @@
  #include <linux/uio.h>
  #include <linux/sched/task.h>
  #include <linux/delayacct.h>
@@ -255,7 +255,7 @@ index 68318134dc92..1a91b6a821e1 100644
 +		spin_unlock(&bpf_mem_swap_lock);
 +		return ret;
 +	}
-+
++	bpf_info.page_data_pages = kmalloc(sizeof(struct page *) * bpf_num_pages, GFP_KERNEL);
 +	// Grab pages for storing memory contents into a user-space buffer (num_page_data_pages indicates how many pages we were given)
 +	if (get_user_pages_fast((unsigned long)page_data, bpf_num_pages, FOLL_WRITE, bpf_info.page_data_pages) != bpf_num_pages) {
 +		ret = -EINVAL;
@@ -263,13 +263,13 @@ index 68318134dc92..1a91b6a821e1 100644
 +		spin_unlock(&bpf_mem_swap_lock);
 +		return ret;
 +	}
-+	bpf_info.page_data_pages = kmalloc(sizeof(struct page) * bpf_num_pages, GFP_KERNEL);
++	
 +	for (i = 0; i < bpf_num_pages; i++) {
 +		// Track pages that we can actively use with a list (must acquire lock before using)
 +		struct mem_swap_bpf_page *bpf_page = kmalloc(sizeof(struct mem_swap_bpf_page), GFP_KERNEL);
 +		bpf_page->addr = page_address(bpf_info.page_data_pages[i]);
 +		INIT_LIST_HEAD(&bpf_page->list);
-+		list_add(&bpf_pages_list, bpf_pages_list.prev);
++		list_add(&bpf_page->list, bpf_pages_list.prev);
 +	}
 +
 +	printk("[BPF swap] Initialized bpf info enabled: %d fd: %d\n", mem_swap_bpf_enabled, bpf_info.fd);
@@ -289,11 +289,12 @@ index 68318134dc92..1a91b6a821e1 100644
 +	};
 +
 +	spin_lock(&bpf_mem_swap_lock);
-+
++	
 +	if (list_empty(&bpf_pages_list)) {
 +		// Can't execute ebpf code without user-space page for page data buffer
 +		// TODO: Make skip ebpf code in final code (instead of returning)
 +		spin_unlock(&bpf_mem_swap_lock);
++		printk("list_empty");
 +		return -ENOMEM;
 +	} else {
 +		page_data_page = list_entry(bpf_pages_list.next, struct mem_swap_bpf_page, list);
@@ -304,14 +305,12 @@ index 68318134dc92..1a91b6a821e1 100644
 +		// memcpy_from_page(page, page_data_page, 0, PAGE_SIZE);
 +	}
 +	spin_unlock(&bpf_mem_swap_lock);
-+
 +	ebpf_prog = bpf_prog_get_type(bpf_fd, BPF_PROG_TYPE_MEM_SWAP);
 +	if (IS_ERR(ebpf_prog)) {
 +		ret = -EINVAL;
 +		printk("test_mem_swap: failed to get bpf prog\n");
 +		return ret;
 +	}
-+
 +	preempt_disable();
 +	ebpf_return = bpf_prog_run(ebpf_prog, &ebpf_context);
 +	if (ebpf_return == EINVAL) {
@@ -320,7 +319,6 @@ index 68318134dc92..1a91b6a821e1 100644
 +		printk("test_mem_swap: ebpf search unknown error %d\n", ebpf_return);
 +	}
 +	preempt_enable();
-+
 +	// Add page back, so that it can be used by a future bpf execution
 +	spin_lock(&bpf_mem_swap_lock);
 +	list_add(&bpf_pages_list, bpf_pages_list.prev);
@@ -404,7 +402,7 @@ index 68318134dc92..1a91b6a821e1 100644
  void end_swap_bio_write(struct bio *bio)
  {
  	struct page *page = bio_first_page_all(bio);
-@@ -529,4 +730,4 @@ void __swap_read_unplug(struct swap_iocb *sio)
+@@ -529,4 +728,4 @@ void __swap_read_unplug(struct swap_iocb *sio)
  	ret = mapping->a_ops->swap_rw(&sio->iocb, &from);
  	if (ret != -EIOCBQUEUED)
  		sio_read_complete(&sio->iocb, ret);

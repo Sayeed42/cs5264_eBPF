@@ -45,18 +45,21 @@ int main(int argc, char *argv[])
 	}
 
 	// Get a page that we can use in our bpf code (kinda hacky)
-	char* scratch_mem = aligned_alloca(4096, 4096);
+	char* scratch_mem = (char *) aligned_alloca(4096, 4096);
 	memset(scratch_mem, 0, 4096);
+	char* page_mem = (char *) aligned_alloca(4096, 4096);
+	memset(page_mem, 0, 4096);
 
 	// Register our bpf code with our syscall
 	printf("First call\n");
-	int res = syscall(451, progfd, scratch_mem);
+	int res = syscall(451, progfd, page_mem, 1, scratch_mem);
 	if (res != 0) {
-		fprintf(stderr, "Failure on syscall");
+		fprintf(stderr, "Failure on syscall %d", res);
+		fprintf(stderr, "%s\n", strerror(res));
 		exit(res);
 	}
 	printf("Second call\n");
-	res = syscall(451, progfd, scratch_mem);
+	res = syscall(451, progfd, page_mem, 1, scratch_mem);
 	if (res != 0) {
 		fprintf(stderr, "Failure on syscall");
 		exit(res);
@@ -94,7 +97,6 @@ int main(int argc, char *argv[])
 		}
 	}
 
-cleanup:
 	bpf_object__close(obj);
 	return 0;
 }
